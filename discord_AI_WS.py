@@ -8,6 +8,8 @@ import discord
 from discord.ext import commands
 from discord import FFmpegOpusAudio
 
+from modules.desktop_audio import DesktopAudio
+
 #need to install pip install websocket-client
 import websocket, threading
 
@@ -80,7 +82,10 @@ async def join(ctx):
                                    min_phrase_length=3, 
                                    max_speakers=4)
         
-        voice_channel.start_recording(whisper_sink, callback, ctx)
+        voice_channel.start_recording(whisper_sink, callback, ctx)        
+        # setup recording here
+        source = DesktopAudio(int(os.environ['AUDIO_DEVICE_ID']))
+        voice_channel.play(source)
 
         await ctx.send("Joining.")
     else:
