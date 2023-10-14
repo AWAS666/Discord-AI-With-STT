@@ -1,4 +1,4 @@
-import asyncio, os, json
+import asyncio, os, json, time
 
 from dotenv import load_dotenv
 
@@ -47,7 +47,7 @@ async def whisper_message(queue : asyncio.Queue):
                 
         username = await get_username(user_id)  
 
-        print(f"{username} Detected Message: {text}")
+        print(f"{time.time()} {username} Detected Message: {text}")
         obj = {
         "name": username.display_name,
         "text": text
@@ -74,10 +74,11 @@ async def join(ctx):
         queue = asyncio.Queue()
         loop.create_task(whisper_message(queue))
         whisper_sink = WhisperSink(queue, 
+                                   loop,
                                    data_length=25000, 
-                                   quiet_phrase_timeout=1.25, 
+                                   quiet_phrase_timeout=1, 
                                    mid_sentence_multiplier=1.75, 
-                                   no_data_multiplier=0.75, 
+                                   no_data_multiplier=0.5, 
                                    max_phrase_timeout=20, 
                                    min_phrase_length=3, 
                                    max_speakers=4)
