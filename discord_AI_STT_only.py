@@ -1,6 +1,8 @@
 import asyncio, os
 
 from dotenv import load_dotenv
+
+from sinks.iwhisper_sink import iWhisperSink
 load_dotenv()
 
 import discord
@@ -62,12 +64,13 @@ async def join(ctx):
         #Replace Sink for either StreamSink or WhisperSink
         queue = asyncio.Queue()
         loop.create_task(whisper_message(queue))
-        whisper_sink = WhisperSink(queue, 
+        whisper_sink = iWhisperSink(queue, 
+                                    loop,
                                    data_length=50000, 
-                                   quiet_phrase_timeout=1.25, 
-                                   mid_sentence_multiplier=1.75, 
-                                   no_data_multiplier=0.75, 
-                                   max_phrase_timeout=20, 
+                                   quiet_phrase_timeout=1, 
+                                   mid_sentence_multiplier=1, 
+                                   no_data_multiplier=0.5, 
+                                   max_phrase_timeout=30, 
                                    min_phrase_length=3, 
                                    max_speakers=4)
         
