@@ -15,12 +15,17 @@ import speech_recognition as sr  # TODO Replace with something simpler
 import torch  # Had issues where removing torch causes whisper to throw an error
 from transformers import pipeline
 from transformers.utils import is_flash_attn_2_available
+
 pipe = pipeline(
     "automatic-speech-recognition",
-    model="openai/whisper-large-v3", # select checkpoint from https://huggingface.co/openai/whisper-large-v3#model-details
+    model="openai/whisper-large-v3",  # select checkpoint from https://huggingface.co/openai/whisper-large-v3#model-details
     torch_dtype=torch.float16,
-    device="cuda:0", # or mps for Mac devices
-    model_kwargs={"attn_implementation": "flash_attention_2"} if is_flash_attn_2_available() else {"attn_implementation": "sdpa"},
+    device="cuda:0",  # or mps for Mac devices
+    model_kwargs=(
+        {"attn_implementation": "flash_attention_2"}
+        if is_flash_attn_2_available()
+        else {"attn_implementation": "sdpa"}
+    ),
 )
 
 # pipe.model = pipe.model.to_bettertransformer() # only if `use_flash_attention_2` is set to False
@@ -77,6 +82,8 @@ class Speaker:
         self.empty_bytes_counter = 0
         self.new_bytes = 1
 
+        self.preflag = False
+
 
 class iWhisperSink(Sink):
     """A sink for discord that takes audio in a voice channel and transcribes it for each user.\n
@@ -107,7 +114,7 @@ class iWhisperSink(Sink):
         no_data_multiplier=0.75,
         max_phrase_timeout=30,
         min_phrase_length=3,
-        max_speakers=-1
+        max_speakers=-1,
     ):
         self.queue = queue
         self.loop = loop
@@ -153,10 +160,20 @@ class iWhisperSink(Sink):
         #     no_speech_threshold = 0.6,
 
         # )
-        outputs = pipe(self.temp_file,
-               chunk_length_s=30,
-               batch_size=24,
-               return_timestamps=True)
+        outputs = pipe(
+            self.temp_file,
+            chunk_length_s=30,
+            batch_size=24,
+            generate_kwargs={"language": "en"},
+            return_timestamps=True,
+        )
+
+        # start = time.time()
+        # # waveform, sampling_rate = audiofile.read(self.temp_file)
+        # waveform, sampling_rate = librosa.load(self.temp_file, mono=True, sr=None)
+        # vad_labels, vad_timestamps = vad(waveform, sampling_rate)
+        # print(time.time() - start)
+
         segments = list(outputs["chunks"])
         result = ""
         for segment in segments:
@@ -212,70 +229,102 @@ class iWhisperSink(Sink):
 
     def insert_voice(self):
         while self.running:
-            if not self.voice_queue.empty():
-                # Sorts data from queue for each speaker after each transcription
-                while not self.voice_queue.empty():
-                    item = self.voice_queue.get()
+            try:
+                if not self.voice_queue.empty():
+                    # Sorts data from queue for each speaker after each transcription
+                    while not self.voice_queue.empty():
+                        item = self.voice_queue.get()
 
-                    user_heard = False
-                    for speaker in self.speakers:
-                        if item[0] == speaker.user:
-                            speaker.data.append(item[1])
-                            user_heard = True
-                            speaker.new_bytes += 1
-                            break
+                        user_heard = False
+                        for speaker in self.speakers:
+                            if item[0] == speaker.user:
+                                speaker.data.append(item[1])
+                                user_heard = True
+                                speaker.new_bytes += 1
+                                break
 
-                    if not user_heard:
-                        if (
-                            self.max_speakers < 0
-                            or len(self.speakers) <= self.max_speakers
+                        if not user_heard:
+                            if (
+                                self.max_speakers < 0
+                                or len(self.speakers) <= self.max_speakers
+                            ):
+                                self.speakers.append(Speaker(item[0], item[1]))
+
+                # STT for each speaker currently talking on discord
+                for speaker in self.speakers:
+                    # No reason to transcribe if no new data has come from discord.
+                    if speaker.new_bytes > 0:
+                        self.transcribe(speaker)
+                        speaker.new_bytes = 0
+                        word_timeout = speaker.word_timeout
+                        speaker.preflag = False
+                    else:
+                        # No data coming in from discord, reduces word_timeout for faster inference
+                        word_timeout = speaker.word_timeout * self.no_data_multiplier
+
+                    current_time = time.time()
+
+                    if len(speaker.phrase) >= self.min_phrase_length:
+                        print(f"{time.time()} {word_timeout}")
+                        if current_time - speaker.last_word > 0.25 and not speaker.preflag:
+                            self.queueUp(
+                                {
+                                    "type": "prefinish",
+                                    "user": speaker.user,
+                                    "result": speaker.phrase,
+                                }
+                            )
+                            speaker.preflag = True
+                        # If the user stops saying anything new or has been speaking too long.
+                        elif (
+                            current_time - speaker.last_word > word_timeout
+                            or current_time - speaker.last_phrase
+                            > self.max_phrase_timeout
                         ):
-                            self.speakers.append(Speaker(item[0], item[1]))
-
-            # STT for each speaker currently talking on discord
-            for speaker in self.speakers:
-                # No reason to transcribe if no new data has come from discord.
-                if speaker.new_bytes > 0:
-                    self.transcribe(speaker)
-                    speaker.new_bytes = 0
-                    word_timeout = speaker.word_timeout
-                else:
-                    # No data coming in from discord, reduces word_timeout for faster inference
-                    word_timeout = speaker.word_timeout * self.no_data_multiplier
-
-                current_time = time.time()
-
-                if len(speaker.phrase) >= self.min_phrase_length:
-                    # If the user stops saying anything new or has been speaking too long.
-                    print(f"{time.time()} {word_timeout}")
-                    if (
-                        current_time - speaker.last_word > word_timeout
-                        or current_time - speaker.last_phrase > self.max_phrase_timeout
-                    ):
-                        self.loop.call_soon_threadsafe(self.queue.put_nowait, {"user": speaker.user, "result": speaker.phrase})
-                        # self.queue.put_nowait(
-                        #     {"user": speaker.user, "result": speaker.phrase}
-                        # )
+                            self.queueUp(
+                                {
+                                    "type": "finish",
+                                    "user": speaker.user,
+                                    "result": speaker.phrase,
+                                }
+                            )
+                            self.speakers.remove(speaker)
+                        else:
+                            # report progress, may have to check if string has actually changed here
+                            self.queueUp(
+                                {
+                                    "type": "progress",
+                                    "user": speaker.user,
+                                    "result": speaker.phrase,
+                                }
+                            )
+                    elif current_time > self.quiet_phrase_timeout * 2:
+                        # Reset Remove the speaker if no valid phrase detected after set period of time
                         self.speakers.remove(speaker)
-                elif current_time > self.quiet_phrase_timeout * 2:
-                    # Reset Remove the speaker if no valid phrase detected after set period of time
-                    self.speakers.remove(speaker)
 
+            except Exception as e:
+                print("Error in loop", e)
             # Loops with no wait time is bad
-            time.sleep(0.01)
+            time.sleep(0.025)
+
+    def queueUp(self, data):
+        print(f"queue: {data['type']}")
+        self.loop.call_soon_threadsafe(self.queue.put_nowait, data)
 
     # Gets audio data from discord for each user talking
     @Filters.container
     def write(self, data, user):
         # Discord will send empty bytes from when the user stopped talking to when the user starts to talk again.
         # Its only the first the first data that grows massive and its only silent audio, so its trimmed.
+        try:
+            data_len = len(data)
+            if data_len > self.data_length:
+                data = data[-self.data_length :]
 
-        data_len = len(data)
-        if data_len > self.data_length:
-            data = data[-self.data_length :]
-
-        # Send bytes to be transcribed
-        self.voice_queue.put([user, data])
+            # Send bytes to be transcribed
+            self.voice_queue.put([user, data])
+        except Exception as e:
+            print("Error in loop", e)
 
     # End thread
     def close(self):
