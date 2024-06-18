@@ -13,12 +13,14 @@ from discord.sinks.core import Filters, Sink, default_filters
 import speech_recognition as sr  # TODO Replace with something simpler
 
 import torch  # Had issues where removing torch causes whisper to throw an error
-from transformers import pipeline
+from transformers import pipeline, AutoProcessor
 from transformers.utils import is_flash_attn_2_available
 
+model_id = "openai/whisper-large-v3"
+processor = AutoProcessor.from_pretrained(model_id)
 pipe = pipeline(
     "automatic-speech-recognition",
-    model="openai/whisper-large-v3",  # select checkpoint from https://huggingface.co/openai/whisper-large-v3#model-details
+    model=model_id,  # select checkpoint from https://huggingface.co/openai/whisper-large-v3#model-details
     torch_dtype=torch.float16,
     device="cuda:0",  # or mps for Mac devices
     model_kwargs=(
@@ -160,13 +162,16 @@ class iWhisperSink(Sink):
         #     no_speech_threshold = 0.6,
 
         # )
+        prompt = "Meteora"
+        prompt_ids = processor.get_prompt_ids(prompt, return_tensors="pt").to("cuda:0")
         outputs = pipe(
             self.temp_file,
             chunk_length_s=30,
             batch_size=24,
-            generate_kwargs={"language": "en"},
+            generate_kwargs={"language": "en", "prompt_ids": prompt_ids},
             return_timestamps=True,
         )
+        # print("With prompt:", outputs["text"][len(prompt) + 1:])
 
         # start = time.time()
         # # waveform, sampling_rate = audiofile.read(self.temp_file)
@@ -174,12 +179,12 @@ class iWhisperSink(Sink):
         # vad_labels, vad_timestamps = vad(waveform, sampling_rate)
         # print(time.time() - start)
 
-        segments = list(outputs["chunks"])
-        result = ""
-        for segment in segments:
-            result += segment["text"]
-        print(result)
-        return result
+        # segments = list(outputs["chunks"])
+        # result = ""
+        # for segment in segments:
+        #     result += segment["text"]
+        # print(result)
+        return outputs["text"][len(prompt) + 1:]
 
     # Get SST from whisper and store result into speaker
     def transcribe(self, speaker: Speaker):
