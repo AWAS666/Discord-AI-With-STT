@@ -78,6 +78,7 @@ class Speaker:
         self.word_timeout = 0
 
         self.phrase = ""
+        self.textBuffer = ""
 
         self.empty_bytes_counter = 0
         self.new_bytes = 1
@@ -151,15 +152,6 @@ class iWhisperSink(Sink):
 
     def transcribe_audio(self):
         # The whisper model
-        # segments, info = audio_model.transcribe(
-        #     self.temp_file,
-        #     beam_size=10,
-        #     best_of=3,
-        #     vad_filter=True,
-        #     vad_parameters=dict(min_silence_duration_ms=250 ),
-        #     no_speech_threshold = 0.6,
-
-        # )
         outputs = pipe(
             self.temp_file,
             chunk_length_s=30,
@@ -168,57 +160,73 @@ class iWhisperSink(Sink):
             return_timestamps=True,
         )
 
-        # start = time.time()
-        # # waveform, sampling_rate = audiofile.read(self.temp_file)
-        # waveform, sampling_rate = librosa.load(self.temp_file, mono=True, sr=None)
-        # vad_labels, vad_timestamps = vad(waveform, sampling_rate)
-        # print(time.time() - start)
-
+        ret = {}
         segments = list(outputs["chunks"])
-        result = ""
-        for segment in segments:
-            result += segment["text"]
-        print(result)
-        return result
+        ret["text"] = ""
+        for seg in segments[:-1]:
+            ret["text"] += seg["text"]
+
+        ret["partial"] = segments[-1]["text"]
+        if len(segments) > 1:
+            ret["cutoff"] = segments[-2]["timestamp"][1]
+        else:
+            ret["cutoff"] = 0
+        return ret
 
     # Get SST from whisper and store result into speaker
     def transcribe(self, speaker: Speaker):
         # TODO Figure out the best way to save the audio fast and remove any noise
+        sampling_rate = self.vc.decoder.SAMPLING_RATE
+        sample_size = self.vc.decoder.SAMPLE_SIZE // self.vc.decoder.CHANNELS
+        channels = self.vc.decoder.CHANNELS
+
         audio_data = sr.AudioData(
             bytes().join(speaker.data),
-            self.vc.decoder.SAMPLING_RATE,
-            self.vc.decoder.SAMPLE_SIZE // self.vc.decoder.CHANNELS,
+            sampling_rate,
+            sample_size,
         )
         wav_data = io.BytesIO(audio_data.get_wav_data())
 
         with open(self.temp_file, "wb") as file:
             wave_writer = wave.open(file, "wb")
-            wave_writer.setnchannels(self.vc.decoder.CHANNELS)
-            wave_writer.setsampwidth(
-                self.vc.decoder.SAMPLE_SIZE // self.vc.decoder.CHANNELS
-            )
-            wave_writer.setframerate(self.vc.decoder.SAMPLING_RATE)
+            wave_writer.setnchannels(channels)
+            wave_writer.setsampwidth(sample_size)
+            wave_writer.setframerate(sampling_rate)
             wave_writer.writeframes(wav_data.getvalue())
             wave_writer.close()
 
         # Transcribe results takes wav file (self.temp_file) and outputs transcription
-        transcription = self.transcribe_audio()
+        textData = self.transcribe_audio()
+        transcription = textData["text"]
+        newText = textData["partial"]
 
         # Checks if user is saying a new valid phrase
-        if self.is_valid_phrase(speaker.phrase, transcription):
+        if self.is_valid_phrase(speaker.phrase, newText):
             speaker.empty_bytes_counter = 0
 
             speaker.word_timeout = self.quiet_phrase_timeout
+            speaker.textBuffer += transcription
+            speaker.phrase = speaker.textBuffer + newText
 
             # Detect if user is mid sentence and delay sending full message
-            if re.search(r"\s*\.{2,}$", transcription) or not re.search(
-                r"[.!?]$", transcription
+            if re.search(r"\s*\.{2,}$", speaker.phrase) or not re.search(
+                r"[.!?]$", speaker.phrase
             ):
                 speaker.word_timeout = (
                     speaker.word_timeout * self.mid_sentence_multiplier
                 )
 
-            speaker.phrase = transcription
+            # find cutoff point to process less audio next time, text gets concotinated
+            raw_bytes = bytes().join(speaker.data)
+            lenB4 = len(raw_bytes)
+            raw_bytes = self.cutoffData(
+                raw_bytes, sampling_rate, sample_size, channels, textData["cutoff"]
+            )
+            lenAfter = len(raw_bytes)
+            if(lenB4 != lenAfter):
+                print(f"Cut off {lenB4-lenAfter} bytes, {lenAfter} bytes remaining")
+            speaker.data = [raw_bytes]
+
             speaker.last_word = time.time()
 
         # If user's mic is on but not saying anything, remove those bytes for faster inference.
@@ -226,6 +234,13 @@ class iWhisperSink(Sink):
             speaker.data = speaker.data[: -speaker.new_bytes]
         else:
             speaker.empty_bytes_counter += 1
+
+    def cutoffData(
+        self, raw_bytes, sampling_rate, sample_size, channels, cutoff_seconds
+    ):
+        byte_rate = sampling_rate * sample_size * channels
+        cutoff_bytes = byte_rate * cutoff_seconds
+        return raw_bytes[int(cutoff_bytes):]
 
     def insert_voice(self):
         while self.running:
@@ -265,8 +280,11 @@ class iWhisperSink(Sink):
                     current_time = time.time()
 
                     if len(speaker.phrase) >= self.min_phrase_length:
-                        print(f"{time.time()} {word_timeout}")
-                        if current_time - speaker.last_word > 0.25 and not speaker.preflag:
+                        # print(f"{time.time()} {word_timeout}")
+                        if (
+                            current_time - speaker.last_word > 0.25
+                            and not speaker.preflag
+                        ):
                             self.queueUp(
                                 {
                                     "type": "prefinish",
@@ -308,7 +326,7 @@ class iWhisperSink(Sink):
             time.sleep(0.025)
 
     def queueUp(self, data):
-        print(f"queue: {data['type']}")
+        # print(f"queue: {data['type']}")
         self.loop.call_soon_threadsafe(self.queue.put_nowait, data)
 
     # Gets audio data from discord for each user talking
