@@ -163,12 +163,16 @@ class iWhisperSink(Sink):
         ret = {}
         segments = list(outputs["chunks"])
         ret["text"] = ""
-        for seg in segments[:-1]:
+        for seg in segments[:-2]:
             ret["text"] += seg["text"]
 
-        ret["partial"] = segments[-1]["text"]
-        if len(segments) > 1:
-            ret["cutoff"] = segments[-2]["timestamp"][1]
+        ret["partial"] = ""
+        for seg in segments[-2:]:
+            ret["partial"] += seg["text"]
+
+        # ret["partial"] = segments[-1]["text"]
+        if len(segments) > 2:
+            ret["cutoff"] = segments[-3]["timestamp"][1]
         else:
             ret["cutoff"] = 0
         return ret
@@ -223,7 +227,7 @@ class iWhisperSink(Sink):
                 raw_bytes, sampling_rate, sample_size, channels, textData["cutoff"]
             )
             lenAfter = len(raw_bytes)
-            if(lenB4 != lenAfter):
+            if lenB4 != lenAfter:
                 print(f"Cut off {lenB4-lenAfter} bytes, {lenAfter} bytes remaining")
             speaker.data = [raw_bytes]
 
@@ -240,7 +244,7 @@ class iWhisperSink(Sink):
     ):
         byte_rate = sampling_rate * sample_size * channels
         cutoff_bytes = byte_rate * cutoff_seconds
-        return raw_bytes[int(cutoff_bytes):]
+        return raw_bytes[int(cutoff_bytes) :]
 
     def insert_voice(self):
         while self.running:
