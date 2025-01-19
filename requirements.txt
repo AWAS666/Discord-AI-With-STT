@@ -7,3 +7,4 @@ py-cord
 transformers
 pyaudio
 python-dotenv
+deepgram-sdk
